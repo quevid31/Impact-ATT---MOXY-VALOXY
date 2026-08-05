@@ -1,0 +1,284 @@
+---
+title: "Analyse MOXY - Impact du DPF dynamique et de la régression OLS"
+author: "Quentin Vidal"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Contexte
+
+Ce fichier analyse les tableaux générés par `mNIRS_OLS.ipynb` (pipeline consolidé, section "II - Transformation et extraction des features") : 4 fichiers `NIRS_OXYMOVE_Features_{condition}.csv` correspondant aux 4 combinaisons `{DPF fixe=4, DPF dynamique} x {avec OLS, sans OLS}`.
+
+Pour chaque condition, on évalue en LOSO (Leave-One-Subject-Out) la capacité du modèle à prédire, à partir des features NIRS (+ épaisseur du tissu adipeux ATT) :
+
+- la **phase de contraction** (concentrique / excentrique)
+- l'**intensité de l'effort** (30% / 50%)
+
+Extrait et adapté de `Impact_DPF_NIRS_Euromov_V2.Rmd` : seuls les chemins de fichiers et le filtre par dispositif ont été modifiés (voir commentaires) pour correspondre à la sortie actuelle du pipeline Python consolidé - le reste de la logique (fonctions, nettoyage, évaluation) est inchangé.
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)        # confusionMatrix()
+library(randomForest)
+library(pROC)         # roc(), auc()
+```
+
+## Épaisseur du tissu adipeux (ATT)
+
+```{r att}
+# --- PARAMÈTRE : chemin vers le tableau contenant le pli cutané de chaque sujet ---
+cahier_labo <- read.csv2("C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/data/donnees_nettoyees.csv", sep = ",")
+
+# Le pli cutané mesuré au compas est un double pli (peau + graisse) : on divise
+# par 2 pour obtenir l'épaisseur réelle du tissu adipeux (ATT). Le sujet 11 n'a
+# pas cette mesure, il est donc exclu de toute analyse utilisant l'ATT.
+cahier_labo <- cahier_labo %>%
+  mutate(
+    Pli.Cutané.VL = as.numeric(Pli.Cutané.VL),
+    ATT.VL = Pli.Cutané.VL / 2
+  ) %>%
+  filter(Subject != 11)
+
+cahier_reduit <- cahier_labo[, c("Subject", "ATT.VL")]
+head(cahier_reduit)
+```
+
+## Fonction d'évaluation LOSO (cible binaire : Phase ou Intensité)
+
+```{r fn_loso}
+# ==============================================================================
+# Évaluation LOSO (Leave-One-Subject-Out) pour une cible BINAIRE
+# ntree_opti a été rendu paramétrable (défaut 500) pour que la fonction soit
+# autonome, sans dépendre d'une valeur "optimale" calculée ailleurs dans le
+# fichier principal.
+# ==============================================================================
+evaluer_modele_loso <- function(data, target_col, pos_class, task_name, feature_cols, ntree_opti = 500) {
+  subjects <- sort(unique(data$subject))
+  lvls <- levels(data[[target_col]])
+  mtry_opti <- max(1, floor(sqrt(length(feature_cols))))  # racine carrée du nb de variables, min. 1
+
+  all_preds <- data.frame(obs = factor(levels = lvls), pred = factor(levels = lvls), prob = numeric())
+  set.seed(42)
+
+  for (test_sub in subjects) {
+    train_df <- data[data$subject != test_sub, ]
+    test_df  <- data[data$subject == test_sub, ]
+    if (nrow(test_df) == 0) next
+
+    rf_fit <- randomForest(x = train_df[, feature_cols], y = train_df[[target_col]],
+                           ntree = ntree_opti, mtry = mtry_opti)
+
+    rf_pred <- factor(predict(rf_fit, test_df[, feature_cols]), levels = lvls)
+    rf_prob <- predict(rf_fit, test_df[, feature_cols], type = "prob")[, pos_class]
+
+    all_preds <- rbind(all_preds, data.frame(obs = test_df[[target_col]], pred = rf_pred, prob = rf_prob))
+  }
+
+  cm <- confusionMatrix(all_preds$pred, all_preds$obs, positive = pos_class, mode = "everything")
+
+  c1 <- lvls[1]; c2 <- lvls[2]
+  F1_1 <- 2 * cm$table[c1, c1] / (2 * cm$table[c1, c1] + cm$table[c1, c2] + cm$table[c2, c1])
+  F1_2 <- 2 * cm$table[c2, c2] / (2 * cm$table[c2, c2] + cm$table[c2, c1] + cm$table[c1, c2])
+
+  roc_curve <- roc(response = all_preds$obs, predictor = all_preds$prob, levels = lvls, quiet = TRUE)
+
+  data.frame(
+    Tache         = task_name,
+    Accuracy      = round(cm$overall["Accuracy"], 3),
+    Balanced_BA   = round(cm$byClass["Balanced Accuracy"], 3),
+    Kappa         = round(cm$overall["Kappa"], 3),
+    Sensitivity   = round(cm$byClass["Sensitivity"], 3),
+    Specificity   = round(cm$byClass["Specificity"], 3),
+    F1_Classe_Neg = round(F1_1, 3),
+    F1_Classe_Pos = round(F1_2, 3),
+    F1_macro      = round(mean(c(F1_1, F1_2), na.rm = TRUE), 3),
+    AUC           = round(as.numeric(auc(roc_curve)), 3)
+  )
+}
+```
+
+## Les 4 combinaisons DPF x OLS
+
+Chaque bloc ci-dessous : lit un des 4 CSV, ne garde que Semaxone, ajoute l'ATT, puis évalue Phase et Intensité.
+
+⚠️ **Ajout par rapport au fichier d'origine** : `NIRS_OXYMOVE_Features_{condition}.csv` contient désormais Semaxone **et** PortaLite (colonne `Recording`) dans le même fichier, alors que l'analyse d'origine ne portait que sur Semaxone. Sans ce filtre, les deux sondes (qui n'ont pas les mêmes canaux) se retrouveraient mélangées et `drop_na()` supprimerait toutes les lignes (même souci que rencontré côté VALOXY).
+
+### DPF dynamique + OLS
+
+```{r cond_dpfdyna_ols}
+# --- PARAMÈTRE : chemin vers le fichier généré par mNIRS_OLS.ipynb ---
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/data/NIRS_OXYMOVE_Features_DPFdyna_OLS.csv"
+df_raw_physio <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+df_raw_physio <- df_raw_physio %>% filter(Recording == "semaxone")
+
+# Ajout de l'épaisseur de l'ATT depuis le cahier de labo
+df_att_mapping <- cahier_reduit %>%
+  mutate(Subject = as.integer(Subject), ATT.VL = as.numeric(gsub(",", ".", as.character(ATT.VL))))
+
+df_merged_physio <- df_raw_physio %>%
+  mutate(Subject = as.integer(Subject)) %>%
+  left_join(df_att_mapping, by = "Subject")
+
+# Colonnes Mean_/Std_ générées par Python (AUC, pics, indicateurs physio) + ATT
+all_cols_physio <- colnames(df_merged_physio)
+FEAT_COLS_PHYSIO <- all_cols_physio[grepl("^(Mean|Std)_", all_cols_physio)]
+FEAT_COLS_FINAL <- c(FEAT_COLS_PHYSIO, "ATT.VL")
+
+df_clean_physio <- df_merged_physio %>%
+  mutate(
+    label_phase = factor(Contraction_Mode, levels = c("Concentric", "Eccentric")),
+    label_int   = factor(Intensity, levels = c("30%", "50%")),
+    subject     = as.character(Subject),
+    across(all_of(FEAT_COLS_FINAL), as.numeric)
+  ) %>%
+  filter(!is.na(label_phase), !is.na(label_int), Subject != 11) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_FINAL))
+
+cat("Nombre de variables explicatives (Physio + Reps + ATT) :", length(FEAT_COLS_FINAL), "\n")
+
+perf_phase_dpfdyna_ols <- evaluer_modele_loso(df_clean_physio, "label_phase", "Concentric", "Phase (Conc/Ecc)", FEAT_COLS_FINAL)
+perf_int_dpfdyna_ols   <- evaluer_modele_loso(df_clean_physio, "label_int", "50%", "Intensité (30/50%)", FEAT_COLS_FINAL)
+
+cat("\n--- DPF dynamique + OLS ---\n")
+print(rbind(perf_phase_dpfdyna_ols, perf_int_dpfdyna_ols))
+```
+
+### DPF dynamique + sans OLS
+
+```{r cond_dpfdyna_noOLS}
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/data/NIRS_OXYMOVE_Features_DPFdyna_NoOLS.csv"
+df_raw_physio <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+df_raw_physio <- df_raw_physio %>% filter(Recording == "semaxone")
+
+df_att_mapping <- cahier_reduit %>%
+  mutate(Subject = as.integer(Subject), ATT.VL = as.numeric(gsub(",", ".", as.character(ATT.VL))))
+
+df_merged_physio <- df_raw_physio %>%
+  mutate(Subject = as.integer(Subject)) %>%
+  left_join(df_att_mapping, by = "Subject")
+
+all_cols_physio <- colnames(df_merged_physio)
+FEAT_COLS_PHYSIO <- all_cols_physio[grepl("^(Mean|Std)_", all_cols_physio)]
+FEAT_COLS_FINAL <- c(FEAT_COLS_PHYSIO, "ATT.VL")
+
+df_clean_physio <- df_merged_physio %>%
+  mutate(
+    label_phase = factor(Contraction_Mode, levels = c("Concentric", "Eccentric")),
+    label_int   = factor(Intensity, levels = c("30%", "50%")),
+    subject     = as.character(Subject),
+    across(all_of(FEAT_COLS_FINAL), as.numeric)
+  ) %>%
+  filter(!is.na(label_phase), !is.na(label_int), Subject != 11) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_FINAL))
+
+cat("Nombre de variables explicatives (Physio + Reps + ATT) :", length(FEAT_COLS_FINAL), "\n")
+
+perf_phase_dpfdyna_nools <- evaluer_modele_loso(df_clean_physio, "label_phase", "Concentric", "Phase (Conc/Ecc)", FEAT_COLS_FINAL)
+perf_int_dpfdyna_nools   <- evaluer_modele_loso(df_clean_physio, "label_int", "50%", "Intensité (30/50%)", FEAT_COLS_FINAL)
+
+cat("\n--- DPF dynamique + sans OLS ---\n")
+print(rbind(perf_phase_dpfdyna_nools, perf_int_dpfdyna_nools))
+```
+
+### DPF fixe = 4 + OLS
+
+```{r cond_dpffixed4_ols}
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/data/NIRS_OXYMOVE_Features_DPFfixed4_OLS.csv"
+df_raw_physio <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+df_raw_physio <- df_raw_physio %>% filter(Recording == "semaxone")
+
+df_att_mapping <- cahier_reduit %>%
+  mutate(Subject = as.integer(Subject), ATT.VL = as.numeric(gsub(",", ".", as.character(ATT.VL))))
+
+df_merged_physio <- df_raw_physio %>%
+  mutate(Subject = as.integer(Subject)) %>%
+  left_join(df_att_mapping, by = "Subject")
+
+all_cols_physio <- colnames(df_merged_physio)
+FEAT_COLS_PHYSIO <- all_cols_physio[grepl("^(Mean|Std)_", all_cols_physio)]
+FEAT_COLS_FINAL <- c(FEAT_COLS_PHYSIO, "ATT.VL")
+
+df_clean_physio <- df_merged_physio %>%
+  mutate(
+    label_phase = factor(Contraction_Mode, levels = c("Concentric", "Eccentric")),
+    label_int   = factor(Intensity, levels = c("30%", "50%")),
+    subject     = as.character(Subject),
+    across(all_of(FEAT_COLS_FINAL), as.numeric)
+  ) %>%
+  filter(!is.na(label_phase), !is.na(label_int), Subject != 11) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_FINAL))
+
+cat("Nombre de variables explicatives (Physio + Reps + ATT) :", length(FEAT_COLS_FINAL), "\n")
+
+perf_phase_dpffixed4_ols <- evaluer_modele_loso(df_clean_physio, "label_phase", "Concentric", "Phase (Conc/Ecc)", FEAT_COLS_FINAL)
+perf_int_dpffixed4_ols   <- evaluer_modele_loso(df_clean_physio, "label_int", "50%", "Intensité (30/50%)", FEAT_COLS_FINAL)
+
+cat("\n--- DPF fixe = 4 + OLS ---\n")
+print(rbind(perf_phase_dpffixed4_ols, perf_int_dpffixed4_ols))
+```
+
+### DPF fixe = 4 + sans OLS
+
+```{r cond_dpffixed4_noOLS}
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/data/NIRS_OXYMOVE_Features_DPFfixed4_NoOLS.csv"
+df_raw_physio <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+df_raw_physio <- df_raw_physio %>% filter(Recording == "semaxone")
+
+df_att_mapping <- cahier_reduit %>%
+  mutate(Subject = as.integer(Subject), ATT.VL = as.numeric(gsub(",", ".", as.character(ATT.VL))))
+
+df_merged_physio <- df_raw_physio %>%
+  mutate(Subject = as.integer(Subject)) %>%
+  left_join(df_att_mapping, by = "Subject")
+
+all_cols_physio <- colnames(df_merged_physio)
+FEAT_COLS_PHYSIO <- all_cols_physio[grepl("^(Mean|Std)_", all_cols_physio)]
+FEAT_COLS_FINAL <- c(FEAT_COLS_PHYSIO, "ATT.VL")
+
+df_clean_physio <- df_merged_physio %>%
+  mutate(
+    label_phase = factor(Contraction_Mode, levels = c("Concentric", "Eccentric")),
+    label_int   = factor(Intensity, levels = c("30%", "50%")),
+    subject     = as.character(Subject),
+    across(all_of(FEAT_COLS_FINAL), as.numeric)
+  ) %>%
+  filter(!is.na(label_phase), !is.na(label_int), Subject != 11) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_FINAL))
+
+cat("Nombre de variables explicatives (Physio + Reps + ATT) :", length(FEAT_COLS_FINAL), "\n")
+
+perf_phase_dpffixed4_nools <- evaluer_modele_loso(df_clean_physio, "label_phase", "Concentric", "Phase (Conc/Ecc)", FEAT_COLS_FINAL)
+perf_int_dpffixed4_nools   <- evaluer_modele_loso(df_clean_physio, "label_int", "50%", "Intensité (30/50%)", FEAT_COLS_FINAL)
+
+cat("\n--- DPF fixe = 4 + sans OLS ---\n")
+print(rbind(perf_phase_dpffixed4_nools, perf_int_dpffixed4_nools))
+```
+
+## Comparaison des 4 conditions
+
+```{r compare, fig.width=14, fig.height=6}
+df_perf_moxy <- bind_rows(
+  perf_phase_dpfdyna_ols     %>% mutate(Modele = "DPFdyna_OLS"),
+  perf_int_dpfdyna_ols       %>% mutate(Modele = "DPFdyna_OLS"),
+  perf_phase_dpfdyna_nools   %>% mutate(Modele = "DPFdyna_NoOLS"),
+  perf_int_dpfdyna_nools     %>% mutate(Modele = "DPFdyna_NoOLS"),
+  perf_phase_dpffixed4_ols   %>% mutate(Modele = "DPFfixed4_OLS"),
+  perf_int_dpffixed4_ols     %>% mutate(Modele = "DPFfixed4_OLS"),
+  perf_phase_dpffixed4_nools %>% mutate(Modele = "DPFfixed4_NoOLS"),
+  perf_int_dpffixed4_nools   %>% mutate(Modele = "DPFfixed4_NoOLS")
+)
+
+ggplot(df_perf_moxy, aes(x = Modele, y = Accuracy, fill = Tache)) +
+  geom_col(position = position_dodge(0.7), width = 0.6) +
+  geom_text(aes(label = paste0(round(Accuracy * 100, 1), "%")),
+            position = position_dodge(0.7), vjust = -0.5, size = 3) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = function(x) paste0(x * 100, "%"), limits = c(0, 1)) +
+  labs(title = "MOXY - Comparaison des 4 conditions DPF x OLS",
+       subtitle = "Ligne pointillée = niveau du hasard pour une cible binaire (50%)",
+       x = NULL, y = "Accuracy", fill = "Tâche") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```

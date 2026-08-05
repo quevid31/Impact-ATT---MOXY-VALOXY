@@ -1,0 +1,311 @@
+---
+title: "Analyse VALOXY - Impact du DPF dynamique et de la régression OLS"
+author: "Quentin Vidal"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Contexte
+
+Ce fichier analyse les 4 tableaux générés par `NIRS_Analysis_Valoxy_VQ_V3.ipynb` (Section 8) : `NIRS_VALOXY_Semaxone_5-15s_{condition}.csv`, correspondant aux 4 combinaisons `{DPF fixe=4, DPF dynamique} x {avec OLS, sans OLS}`. Les features (AUC, Min, Max, Pente, SmO2) sont calculées sur la fenêtre 5-15s, pour Semaxone uniquement.
+
+Pour chaque condition, on évalue en LOSO (Leave-One-Subject-Out) la capacité d'un Random Forest multiclasse à prédire l'**intensité de contraction** (20% / 40% / 60% MVC), avec une normalisation z-score intra-sujet (retire le "gain" NIRS propre à chaque sujet, ne garde que sa modulation relative).
+
+Extrait tel quel de `Impact_DPF_NIRS_Euromov_V2.Rmd` (section "feat: min max...") - ces chunks fonctionnaient déjà correctement, aucune adaptation nécessaire.
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)        # confusionMatrix()
+library(randomForest)
+```
+
+## Fonction d'évaluation LOSO multiclasse
+
+```{r fn_loso_multiclasse}
+# ==============================================================================
+# Évaluation LOSO (Leave-One-Subject-Out) pour une cible MULTICLASSE (3 intensités)
+# ==============================================================================
+evaluer_modele_loso_multiclasse <- function(data, target_col, task_name, feature_cols, ntree_opti = 500) {
+  subjects <- sort(unique(data$subject))
+  lvls <- levels(data[[target_col]])
+  mtry_opti <- max(1, floor(sqrt(length(feature_cols)))) 
+  
+  all_preds <- data.frame(obs=factor(levels=lvls), pred=factor(levels=lvls))
+  set.seed(42)
+  
+  for (test_sub in subjects) {
+    train_df <- data[data$subject != test_sub, ]
+    test_df  <- data[data$subject == test_sub, ]
+    
+    if(nrow(test_df) == 0) next
+    
+    # Entraînement avec les variables sélectionnées
+    rf_fit <- randomForest(x = train_df[, feature_cols], y = train_df[[target_col]], 
+                           ntree = ntree_opti, mtry = mtry_opti)
+    
+    # Prédictions (en multiclasse, on prédit directement la classe)
+    rf_pred <- factor(predict(rf_fit, test_df[, feature_cols]), levels = lvls)
+    
+    all_preds <- rbind(all_preds, data.frame(obs = test_df[[target_col]], pred = rf_pred))
+  }
+  
+  # Matrice de confusion
+  cm <- confusionMatrix(all_preds$pred, all_preds$obs)
+  
+  # Calculs Macro (Moyenne sur les 3 classes : 20%, 40%, 60%)
+  f1_macro <- mean(cm$byClass[, "F1"], na.rm = TRUE)
+  sens_macro <- mean(cm$byClass[, "Sensitivity"], na.rm = TRUE)
+  spec_macro <- mean(cm$byClass[, "Specificity"], na.rm = TRUE)
+  
+  # Retourne une ligne de tableau
+  data.frame(
+    Tache             = task_name,
+    Classes           = length(lvls),
+    Accuracy          = round(cm$overall["Accuracy"], 3),
+    Niveau_Hasard     = round(1 / length(lvls), 3) # Pour 3 classes, la chance est à 33.3%
+  )
+}
+
+# ==============================================================================
+# Normalisation z-score intra-sujet (avant la boucle LOSO)
+# ==============================================================================
+# Pourquoi : l'amplitude NIRS absolue dépend énormément du sujet (épaisseur
+# adipeuse, placement de sonde...), ce qui varie très peu à l'intérieur des
+# lignes d'un même sujet mais énormément d'un sujet à l'autre. En LOSO, le
+# modèle doit apprendre un seuil valable pour des sujets aux "gains" très
+# différents - centrer-réduire chaque feature PAR SUJET isole la modulation
+# liée à l'intensité de ce bruit inter-individuel.
+# Ce n'est pas une fuite : chaque sujet est normalisé avec ses seules propres
+# données, aussi bien côté entraînement que côté sujet testé.
+normaliser_zscore_par_sujet <- function(df, feature_cols) {
+  df %>%
+    group_by(subject) %>%
+    mutate(across(all_of(feature_cols), ~ {
+      s <- sd(.x, na.rm = TRUE)
+      if (is.na(s) || s < 1e-8) .x - mean(.x, na.rm = TRUE) else (.x - mean(.x, na.rm = TRUE)) / s
+    })) %>%
+    ungroup()
+}
+```
+
+## Les 4 combinaisons DPF x OLS
+
+### DPF dynamique + OLS
+
+```{r cond_dpfdyna_ols}
+# --- PARAMÈTRE : chemin vers le fichier généré par NIRS_Analysis_Valoxy_VQ_V3.ipynb ---
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFdyna_OLS.csv"
+
+# Lecture du fichier
+df_val_raw <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+
+# Identification dynamique de TOUTES les colonnes de features générées par Python
+all_cols <- colnames(df_val_raw)
+FEAT_COLS_COMPLEX <- all_cols[grepl("^(Mean|Std)_", all_cols)]
+
+df_clean_val <- df_val_raw %>%
+  mutate(
+    label_int   = factor(Intensity, levels = c("20%", "40%", "60%")),
+    subject     = as.character(Subject), 
+    across(all_of(FEAT_COLS_COMPLEX), as.numeric) 
+  ) %>%
+  filter(!is.na(label_int)) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_COMPLEX))
+
+cat("Nombre de variables explicatives utilisées :", length(FEAT_COLS_COMPLEX), "\n")
+
+# Normalisation z-score intra-sujet
+df_clean_val_norm <- normaliser_zscore_par_sujet(df_clean_val, FEAT_COLS_COMPLEX)
+
+# Évaluation
+perf_int_feat_norm1 <- evaluer_modele_loso_multiclasse(
+  data         = df_clean_val_norm, 
+  target_col   = "label_int", 
+  task_name    = "Intensité (20/40/60%)", 
+  feature_cols = FEAT_COLS_COMPLEX,
+  ntree_opti   = 500
+)
+
+cat("\n--- DPF dynamique + OLS (Z-score intra-sujet) ---\n")
+print(perf_int_feat_norm1)
+```
+
+### DPF dynamique + sans OLS
+
+```{r cond_dpfdyna_noOLS}
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFdyna_NoOLS.csv"
+df_val_raw <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+
+all_cols <- colnames(df_val_raw)
+FEAT_COLS_COMPLEX <- all_cols[grepl("^(Mean|Std)_", all_cols)]
+
+df_clean_val <- df_val_raw %>%
+  mutate(
+    label_int   = factor(Intensity, levels = c("20%", "40%", "60%")),
+    subject     = as.character(Subject), 
+    across(all_of(FEAT_COLS_COMPLEX), as.numeric) 
+  ) %>%
+  filter(!is.na(label_int)) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_COMPLEX))
+
+cat("Nombre de variables explicatives utilisées :", length(FEAT_COLS_COMPLEX), "\n")
+
+df_clean_val <- normaliser_zscore_par_sujet(df_clean_val, FEAT_COLS_COMPLEX)
+
+perf_int_feat2 <- evaluer_modele_loso_multiclasse(
+  data         = df_clean_val, 
+  target_col   = "label_int", 
+  task_name    = "Intensité (20/40/60%)", 
+  feature_cols = FEAT_COLS_COMPLEX,
+  ntree_opti   = 500
+)
+
+cat("\n--- DPF dynamique + sans OLS (Z-score intra-sujet) ---\n")
+print(perf_int_feat2)
+```
+
+### DPF fixe = 4 + OLS
+
+```{r cond_dpffixed4_ols}
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFfixed4_OLS.csv"
+df_val_raw <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+
+all_cols <- colnames(df_val_raw)
+FEAT_COLS_COMPLEX <- all_cols[grepl("^(Mean|Std)_", all_cols)]
+
+df_clean_val <- df_val_raw %>%
+  mutate(
+    label_int   = factor(Intensity, levels = c("20%", "40%", "60%")),
+    subject     = as.character(Subject), 
+    across(all_of(FEAT_COLS_COMPLEX), as.numeric) 
+  ) %>%
+  filter(!is.na(label_int)) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_COMPLEX))
+
+cat("Nombre de variables explicatives utilisées :", length(FEAT_COLS_COMPLEX), "\n")
+
+df_clean_val <- normaliser_zscore_par_sujet(df_clean_val, FEAT_COLS_COMPLEX)
+
+perf_int_feat3 <- evaluer_modele_loso_multiclasse(
+  data         = df_clean_val, 
+  target_col   = "label_int", 
+  task_name    = "Intensité (20/40/60%)", 
+  feature_cols = FEAT_COLS_COMPLEX,
+  ntree_opti   = 500
+)
+
+cat("\n--- DPF fixe = 4 + OLS (Z-score intra-sujet) ---\n")
+print(perf_int_feat3)
+```
+
+### DPF fixe = 4 + sans OLS
+
+```{r cond_dpffixed4_noOLS}
+chemin_fichier <- "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFfixed4_NoOLS.csv"
+df_val_raw <- read.csv2(chemin_fichier, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+
+all_cols <- colnames(df_val_raw)
+FEAT_COLS_COMPLEX <- all_cols[grepl("^(Mean|Std)_", all_cols)]
+
+df_clean_val <- df_val_raw %>%
+  mutate(
+    label_int   = factor(Intensity, levels = c("20%", "40%", "60%")),
+    subject     = as.character(Subject), 
+    across(all_of(FEAT_COLS_COMPLEX), as.numeric) 
+  ) %>%
+  filter(!is.na(label_int)) %>%
+  tidyr::drop_na(all_of(FEAT_COLS_COMPLEX))
+
+cat("Nombre de variables explicatives utilisées :", length(FEAT_COLS_COMPLEX), "\n")
+
+df_clean_val <- normaliser_zscore_par_sujet(df_clean_val, FEAT_COLS_COMPLEX)
+
+perf_int_feat4 <- evaluer_modele_loso_multiclasse(
+  data         = df_clean_val, 
+  target_col   = "label_int", 
+  task_name    = "Intensité (20/40/60%)", 
+  feature_cols = FEAT_COLS_COMPLEX,
+  ntree_opti   = 500
+)
+
+cat("\n--- DPF fixe = 4 + sans OLS (Z-score intra-sujet) ---\n")
+print(perf_int_feat4)
+```
+
+## Comparaison des 4 conditions
+
+```{r compare_accuracy, fig.width=14, fig.height=6}
+df_perf_4_modeles <- bind_rows(
+  perf_int_feat_norm1 %>% mutate(Modele = "DPFdyna_OLS"),
+  perf_int_feat2      %>% mutate(Modele = "DPFdyna_NoOLS"),
+  perf_int_feat3      %>% mutate(Modele = "DPFfixed4_OLS"),
+  perf_int_feat4      %>% mutate(Modele = "DPFfixed4_NoOLS")
+)
+
+ggplot(df_perf_4_modeles, aes(x = Modele, y = Accuracy, fill = Modele)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(Accuracy * 100, 1), "%")), vjust = -0.5, size = 4) +
+  geom_hline(aes(yintercept = Niveau_Hasard), linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = function(x) paste0(x * 100, "%"), limits = c(0, 1)) +
+  labs(title = "VALOXY - Comparaison de l'Accuracy des 4 conditions",
+       subtitle = "Ligne pointillée = niveau du hasard (33.3%)",
+       x = NULL, y = "Accuracy") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+## Top 20 des variables les plus importantes, pour chacune des 4 conditions
+
+```{r top20_importance, fig.width=14, fig.height=6}
+fichiers_4_modeles <- list(
+  DPFdyna_OLS     = "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFdyna_OLS.csv",
+  DPFdyna_NoOLS   = "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFdyna_NoOLS.csv",
+  DPFfixed4_OLS   = "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFfixed4_OLS.csv",
+  DPFfixed4_NoOLS = "C:/Users/quevi/OneDrive/Documents/STAGE_EUROMOV/quentin/results/NIRS_VALOXY_Semaxone_5-15s_DPFfixed4_NoOLS.csv"
+)
+
+for (nom_modele in names(fichiers_4_modeles)) {
+
+  df_raw <- read.csv2(fichiers_4_modeles[[nom_modele]], stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+  feat_cols <- colnames(df_raw)[grepl("^(Mean|Std)_", colnames(df_raw))]
+
+  df_clean <- df_raw %>%
+    mutate(
+      label_int = factor(Intensity, levels = c("20%", "40%", "60%")),
+      subject   = as.character(Subject),
+      across(all_of(feat_cols), as.numeric)
+    ) %>%
+    filter(!is.na(label_int)) %>%
+    tidyr::drop_na(all_of(feat_cols)) %>%
+    group_by(subject) %>%
+    mutate(across(all_of(feat_cols), ~ {
+      s <- sd(.x, na.rm = TRUE)
+      if (is.na(s) || s < 1e-8) .x - mean(.x, na.rm = TRUE) else (.x - mean(.x, na.rm = TRUE)) / s
+    })) %>%
+    ungroup()
+
+  # Un seul fit sur toutes les données (pas de LOSO ici) juste pour l'importance des variables
+  set.seed(42)
+  rf_fit <- randomForest(x = df_clean[, feat_cols], y = df_clean$label_int,
+                          ntree = 500, mtry = max(1, floor(sqrt(length(feat_cols)))),
+                          importance = TRUE)
+
+  df_importance_top20 <- data.frame(
+    Feature = rownames(randomForest::importance(rf_fit, type = 2)),
+    Importance = randomForest::importance(rf_fit, type = 2)[, 1]
+  ) %>%
+    slice_max(order_by = Importance, n = 20)
+
+  p <- ggplot(df_importance_top20, aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(title = paste("Top 20 features -", nom_modele),
+         subtitle = "Mean Decrease Gini (fit unique, toutes données, z-score intra-sujet)",
+         x = NULL, y = "Importance (Mean Decrease Gini)") +
+    theme_minimal()
+
+  print(p)
+}
+```
